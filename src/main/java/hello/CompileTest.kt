@@ -194,7 +194,7 @@ fun main() {
 
     val function = analyzeContext.functions.keys.first()
     val body = function.bodyExpression as KtBlockExpression
-    body.statements.forEach {
-        println(it.context?.text)
-    }
+
+    println(body.firstStatement?.text)
+
 }
