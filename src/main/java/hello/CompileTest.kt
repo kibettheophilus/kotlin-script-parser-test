@@ -35,7 +35,6 @@ import org.jetbrains.kotlin.resolve.TopDownAnalysisMode
 import org.jetbrains.kotlin.utils.PathUtil
 import java.io.File
 import java.util.logging.Logger
-import kotlin.io.path.Path
 
 class KotlinScriptParser {
     private class SourceModuleInfo(
