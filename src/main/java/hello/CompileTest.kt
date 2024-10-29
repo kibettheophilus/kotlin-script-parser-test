@@ -162,7 +162,7 @@ class KotlinScriptParser {
 
 
 fun main() {
-    val scriptFile = "/media/data/java/blackfern/kotlin-compile-test/test.kt"
+    val scriptFile = "/Users/theophiluskibet/StudioProjects/kotlin-script-parser-test/test.kt"
 
     val parser = KotlinScriptParser()
 
