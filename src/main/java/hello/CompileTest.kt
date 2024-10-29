@@ -7,48 +7,52 @@ import org.jetbrains.kotlin.analyzer.ResolverForSingleModuleProject
 import org.jetbrains.kotlin.analyzer.common.CommonAnalysisParameters
 import org.jetbrains.kotlin.analyzer.common.CommonPlatformAnalyzerServices
 import org.jetbrains.kotlin.analyzer.common.CommonResolverForModuleFactory
-import org.jetbrains.kotlin.cli.common.CLIConfigurationKeys
 import org.jetbrains.kotlin.cli.common.config.addKotlinSourceRoot
-import org.jetbrains.kotlin.cli.common.messages.CompilerMessageLocation
 import org.jetbrains.kotlin.cli.common.messages.CompilerMessageSeverity
+import org.jetbrains.kotlin.cli.common.messages.CompilerMessageSourceLocation
 import org.jetbrains.kotlin.cli.common.messages.GroupingMessageCollector
 import org.jetbrains.kotlin.cli.common.messages.MessageCollector
 import org.jetbrains.kotlin.cli.jvm.compiler.EnvironmentConfigFiles
 import org.jetbrains.kotlin.cli.jvm.compiler.KotlinCoreEnvironment
 import org.jetbrains.kotlin.cli.jvm.config.addJvmClasspathRoots
+import org.jetbrains.kotlin.config.CommonConfigurationKeys
 import org.jetbrains.kotlin.config.CompilerConfiguration
 import org.jetbrains.kotlin.config.LanguageFeature
 import org.jetbrains.kotlin.config.LanguageVersionSettings
 import org.jetbrains.kotlin.config.languageVersionSettings
 import org.jetbrains.kotlin.container.tryGetService
 import org.jetbrains.kotlin.context.ProjectContext
-import org.jetbrains.kotlin.descriptors.ModuleDescriptor
+import org.jetbrains.kotlin.descriptors.ModuleCapability
 import org.jetbrains.kotlin.name.Name
 import org.jetbrains.kotlin.platform.CommonPlatforms
 import org.jetbrains.kotlin.platform.TargetPlatform
 import org.jetbrains.kotlin.psi.KtBlockExpression
-import org.jetbrains.kotlin.resolve.*
+import org.jetbrains.kotlin.resolve.CompilerEnvironment
+import org.jetbrains.kotlin.resolve.LazyTopDownAnalyzer
+import org.jetbrains.kotlin.resolve.PlatformDependentAnalyzerServices
+import org.jetbrains.kotlin.resolve.TopDownAnalysisContext
+import org.jetbrains.kotlin.resolve.TopDownAnalysisMode
 import org.jetbrains.kotlin.utils.PathUtil
 import java.io.File
-import java.util.*
 import java.util.logging.Logger
+import kotlin.io.path.Path
 
 class KotlinScriptParser {
     private class SourceModuleInfo(
-            override val name: Name,
-            override val capabilities: Map<ModuleDescriptor.Capability<*>, Any?>,
-            private val dependOnOldBuiltIns: Boolean,
-            override val analyzerServices: PlatformDependentAnalyzerServices = CommonPlatformAnalyzerServices,
-            override val platform: TargetPlatform = CommonPlatforms.defaultCommonPlatform
+        override val name: Name,
+        override val capabilities: Map<ModuleCapability<*>, Any?>,
+        private val dependOnOldBuiltIns: Boolean,
+        override val analyzerServices: PlatformDependentAnalyzerServices = CommonPlatformAnalyzerServices,
+        override val platform: TargetPlatform = CommonPlatforms.defaultCommonPlatform
     ) : ModuleInfo {
         override fun dependencies() = listOf(this)
 
         override fun dependencyOnBuiltIns(): ModuleInfo.DependencyOnBuiltIns =
-                if (dependOnOldBuiltIns) {
-                    ModuleInfo.DependencyOnBuiltIns.LAST
-                } else {
-                    ModuleInfo.DependencyOnBuiltIns.NONE
-                }
+            if (dependOnOldBuiltIns) {
+                ModuleInfo.DependencyOnBuiltIns.LAST
+            } else {
+                ModuleInfo.DependencyOnBuiltIns.NONE
+            }
     }
 
     companion object {
@@ -64,7 +68,11 @@ class KotlinScriptParser {
                 return hasErrors
             }
 
-            override fun report(severity: CompilerMessageSeverity, message: String, location: CompilerMessageLocation?) {
+            override fun report(
+                severity: CompilerMessageSeverity,
+                message: String,
+                location: CompilerMessageSourceLocation?
+            ) {
                 val text = if (location != null) {
                     val path = location.path
                     val position = "$path: (${location.line}, ${location.column}) "
@@ -77,13 +85,16 @@ class KotlinScriptParser {
                     CompilerMessageSeverity.VERBOSE.contains(severity) -> {
                         LOG.finest(text)
                     }
+
                     severity == CompilerMessageSeverity.ERROR -> {
                         LOG.severe(text)
                         hasErrors = true
                     }
+
                     severity == CompilerMessageSeverity.INFO -> {
                         LOG.info(text)
                     }
+
                     else -> {
                         LOG.warning(text)
                     }
@@ -102,9 +113,9 @@ class KotlinScriptParser {
         // The Kotlin compiler configuration
         val configuration = CompilerConfiguration()
 
-        val groupingCollector = GroupingMessageCollector(messageCollector, false)
-        val severityCollector = GroupingMessageCollector(groupingCollector, false)
-        configuration.put(CLIConfigurationKeys.MESSAGE_COLLECTOR_KEY, severityCollector)
+        val groupingCollector = GroupingMessageCollector(messageCollector, false, false)
+        val severityCollector = GroupingMessageCollector(groupingCollector, false, false)
+        configuration.put(CommonConfigurationKeys.MESSAGE_COLLECTOR_KEY, severityCollector)
 
         configuration.addJvmClasspathRoots(PathUtil.getJdkClassesRootsFromCurrentJre())
 
@@ -116,41 +127,54 @@ class KotlinScriptParser {
         val rootDisposable = Disposer.newDisposable()
 
         try {
-            val environment = KotlinCoreEnvironment.createForProduction(rootDisposable, configuration, EnvironmentConfigFiles.JVM_CONFIG_FILES)
+            val environment = KotlinCoreEnvironment.createForProduction(
+                rootDisposable,
+                configuration,
+                EnvironmentConfigFiles.JVM_CONFIG_FILES
+            )
             val ktFiles = environment.getSourceFiles()
 
             val moduleInfo = SourceModuleInfo(Name.special("<main"), mapOf(), false)
-            val project = ktFiles.firstOrNull()?.project ?: throw AssertionError("No files to analyze")
+            val project =
+                ktFiles.firstOrNull()?.project ?: throw AssertionError("No files to analyze")
 
-            val multiplatformLanguageSettings = object : LanguageVersionSettings by configuration.languageVersionSettings {
-                override fun getFeatureSupport(feature: LanguageFeature): LanguageFeature.State =
+            val multiplatformLanguageSettings =
+                object : LanguageVersionSettings by configuration.languageVersionSettings {
+                    override fun getFeatureSupport(feature: LanguageFeature): LanguageFeature.State =
                         if (feature == LanguageFeature.MultiPlatformProjects) LanguageFeature.State.ENABLED
                         else configuration.languageVersionSettings.getFeatureSupport(feature)
-            }
+                }
 
             val resolverForModuleFactory = CommonResolverForModuleFactory(
-                    CommonAnalysisParameters { content ->
+                platformParameters = CommonAnalysisParameters(
+                    metadataPartProviderFactory = {content->
                         environment.createPackagePartProvider(content.moduleContentScope)
-                    },
-                    CompilerEnvironment,
-                    CommonPlatforms.defaultCommonPlatform,
-                    shouldCheckExpectActual = false
+                    } ,
+                    klibMetadataPackageFragmentProviderFactory = null
+                ),
+                targetEnvironment = CompilerEnvironment,
+                targetPlatform = CommonPlatforms.defaultCommonPlatform,
+                shouldCheckExpectActual = false
             )
 
             val resolver = ResolverForSingleModuleProject(
-                    "sources for metadata serializer",
-                    ProjectContext(project, "metadata serializer"),
-                    moduleInfo,
-                    resolverForModuleFactory,
-                    GlobalSearchScope.allScope(project),
-                    languageVersionSettings = multiplatformLanguageSettings,
-                    syntheticFiles = ktFiles
+                "sources for metadata serializer",
+                ProjectContext(project, "metadata serializer"),
+                moduleInfo,
+                resolverForModuleFactory,
+                GlobalSearchScope.allScope(project),
+                languageVersionSettings = multiplatformLanguageSettings,
+                syntheticFiles = ktFiles
             )
 
             val container = resolver.resolverForModule(moduleInfo).componentProvider
 
-            val lazyTopDownAnalyzer = container.tryGetService(LazyTopDownAnalyzer::class.java) as LazyTopDownAnalyzer
-            return lazyTopDownAnalyzer.analyzeDeclarations(TopDownAnalysisMode.TopLevelDeclarations, ktFiles)
+            val lazyTopDownAnalyzer =
+                container.tryGetService(LazyTopDownAnalyzer::class.java) as LazyTopDownAnalyzer
+            return lazyTopDownAnalyzer.analyzeDeclarations(
+                TopDownAnalysisMode.TopLevelDeclarations,
+                ktFiles
+            )
         } finally {
             rootDisposable.dispose()
             if (severityCollector.hasErrors()) {
@@ -162,7 +186,7 @@ class KotlinScriptParser {
 
 
 fun main() {
-    val scriptFile = "/Users/theophiluskibet/StudioProjects/kotlin-script-parser-test/test.kt"
+    val scriptFile = System.getProperty("user.dir").plus("/test.kt")
 
     val parser = KotlinScriptParser()
 
@@ -170,5 +194,7 @@ fun main() {
 
     val function = analyzeContext.functions.keys.first()
     val body = function.bodyExpression as KtBlockExpression
-    val i = 0;
+    body.statements.forEach {
+        println(it.context?.text)
+    }
 }
